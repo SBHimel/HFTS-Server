@@ -5,7 +5,18 @@ import { requireAuth } from "../middleware/authMiddleware.js";
 
 const router = Router();
 
-// GET / - fetch collections owned by the authenticated user
+// ── Helper ─────────────────────────────────────────────────────────────────
+
+/** Return true only when s is a 24-character hex MongoDB ObjectId. */
+const OBJECT_ID_RE = /^[0-9a-f]{24}$/i;
+function isValidObjectId(s: unknown): s is string {
+  return typeof s === "string" && OBJECT_ID_RE.test(s);
+}
+
+const NAME_MAX_LEN = 60; // server-side cap (client shows 40)
+
+// ── GET / ──────────────────────────────────────────────────────────────────
+// Fetch only collections owned by the authenticated user.
 router.get("/", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const collections = await Collection.find({ userId: req.user!.id }).sort({ createdAt: 1 });
@@ -18,18 +29,22 @@ router.get("/", requireAuth, async (req: Request, res: Response): Promise<void> 
   }
 });
 
-// POST / - create a new collection
+// ── POST / ─────────────────────────────────────────────────────────────────
+// Create a new collection. userId always comes from the session.
 router.post("/", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { name } = req.body;
+
     if (!name || typeof name !== "string" || !name.trim()) {
       res.status(400).json({ message: "Collection name is required" });
       return;
     }
 
+    const trimmed = name.trim().slice(0, NAME_MAX_LEN);
+
     const collection = await Collection.create({
-      name: name.trim(),
-      userId: req.user!.id,
+      name: trimmed,
+      userId: req.user!.id, // always from session — never from body
     });
 
     res.status(201).json(collection);
@@ -41,14 +56,16 @@ router.post("/", requireAuth, async (req: Request, res: Response): Promise<void>
   }
 });
 
-// PATCH /:id - rename a collection (ownership enforced)
+// ── PATCH /:id ─────────────────────────────────────────────────────────────
+// Rename a collection. Only the owner may do this.
 router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
     const { name } = req.body;
 
-    if (!id) {
-      res.status(400).json({ message: "Collection ID is required" });
+    // ① Validate ObjectId format
+    if (!isValidObjectId(id)) {
+      res.status(400).json({ message: "Invalid collection ID" });
       return;
     }
 
@@ -63,12 +80,13 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
       return;
     }
 
+    // ② Ownership check
     if (collection.userId !== req.user!.id) {
       res.status(403).json({ message: "Forbidden: You do not own this collection" });
       return;
     }
 
-    collection.name = name.trim();
+    collection.name = name.trim().slice(0, NAME_MAX_LEN);
     await collection.save();
 
     res.json(collection);
@@ -80,12 +98,17 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
   }
 });
 
-// DELETE /:id - delete a collection and uncategorize its memories
+// ── DELETE /:id ─────────────────────────────────────────────────────────────
+// Delete a collection and uncategorize ALL memories that reference it
+// (regardless of who authored them, since any memory can reference a
+// collection by ID).
 router.delete("/:id", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    if (!id) {
-      res.status(400).json({ message: "Collection ID is required" });
+
+    // ① Validate ObjectId format
+    if (!id || !isValidObjectId(id)) {
+      res.status(400).json({ message: "Invalid collection ID" });
       return;
     }
 
@@ -95,16 +118,15 @@ router.delete("/:id", requireAuth, async (req: Request, res: Response): Promise<
       return;
     }
 
+    // ② Ownership check
     if (collection.userId !== req.user!.id) {
       res.status(403).json({ message: "Forbidden: You do not own this collection" });
       return;
     }
 
-    // Uncategorize all memories previously belonging to this collection
-    await Memory.updateMany(
-      { collectionId: id, userId: req.user!.id },
-      { $set: { collectionId: null } }
-    );
+    // ③ Cascade: uncategorize every memory pointing at this collection,
+    //    not just the owner's, to avoid stale collectionId references.
+    await Memory.updateMany({ collectionId: id }, { $set: { collectionId: null } });
 
     await Collection.findByIdAndDelete(id);
 

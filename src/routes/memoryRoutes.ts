@@ -1,34 +1,63 @@
 import { Router, type Request, type Response } from "express";
 import { Memory } from "../models/Memory.js";
+import { Collection } from "../models/Collection.js";
 import { requireAuth } from "../middleware/authMiddleware.js";
 
 const router = Router();
 
-// GET / - filter by optional year, search query, collectionId; public + user's own private (if auth) or only public approved (if guest)
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/** Escape special regex metacharacters to prevent ReDoS. */
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Return true only when s is a 24-character lowercase hex MongoDB ObjectId. */
+const OBJECT_ID_RE = /^[0-9a-f]{24}$/i;
+function isValidObjectId(s: unknown): s is string {
+  return typeof s === "string" && OBJECT_ID_RE.test(s);
+}
+
+/** Clamp a year to a sane range. */
+const YEAR_MIN = 2000;
+const YEAR_MAX = 2100;
+
+function clampYear(raw: unknown): number | null {
+  const n = Number(raw);
+  if (isNaN(n) || n < YEAR_MIN || n > YEAR_MAX) return null;
+  return Math.floor(n);
+}
+
+// ── GET / ─────────────────────────────────────────────────────────────────
+// Public + user's own private (if auth); guests see only public+approved.
 router.get("/", async (req: Request, res: Response): Promise<void> => {
   try {
     const filter: Record<string, any> = {};
 
+    // ① Visibility / ownership filter — never trust client
     if (req.user?.id) {
       filter.$or = [
         { visibility: "public", isApproved: true },
-        { userId: req.user.id },
+        { userId: req.user.id }, // owner sees their own regardless of visibility/approval
       ];
     } else {
       filter.visibility = "public";
       filter.isApproved = true;
     }
 
-    if (req.query.year) {
-      const yearNum = Number(req.query.year);
-      if (!isNaN(yearNum)) {
-        filter.year = yearNum;
+    // ② Year filter — validate and clamp range
+    if (req.query.year !== undefined && req.query.year !== "") {
+      const yearNum = clampYear(req.query.year);
+      if (yearNum === null) {
+        res.status(400).json({ message: "year must be a number between 2000 and 2100" });
+        return;
       }
+      filter.year = yearNum;
     }
 
-    // Search by title, story or authorName
+    // ③ Search — escape regex metacharacters (ReDoS prevention)
     if (req.query.search && typeof req.query.search === "string" && req.query.search.trim()) {
-      const term = req.query.search.trim();
+      const term = escapeRegex(req.query.search.trim().slice(0, 200)); // cap length
       const searchRegex = { $regex: term, $options: "i" };
       const searchCondition = [
         { title: searchRegex },
@@ -36,29 +65,47 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
         { authorName: searchRegex },
       ];
       if (filter.$or) {
-        filter.$and = [
-          { $or: filter.$or },
-          { $or: searchCondition },
-        ];
+        filter.$and = [{ $or: filter.$or }, { $or: searchCondition }];
         delete filter.$or;
       } else {
         filter.$or = searchCondition;
       }
     }
 
-    // Filter by collection
+    // ④ collectionId filter
+    // - "all" → no extra filter
+    // - "uncategorized" → collectionId: null
+    // - specific ID → validate format; if the caller is authenticated and the
+    //   collection exists, it must belong to them (prevents fishing through
+    //   another user's private collection using a guessed collection ID).
     if (req.query.collectionId && typeof req.query.collectionId === "string") {
       const col = req.query.collectionId.trim();
       if (col === "uncategorized") {
         filter.collectionId = null;
       } else if (col !== "all") {
+        if (!isValidObjectId(col)) {
+          res.status(400).json({ message: "Invalid collectionId format" });
+          return;
+        }
+        // If the caller is authenticated, enforce collection ownership so they
+        // cannot enumerate another user's collection contents.
+        if (req.user?.id) {
+          const colDoc = await Collection.findById(col).lean();
+          if (!colDoc || colDoc.userId !== req.user.id) {
+            // Return empty rather than 403 to avoid leaking existence
+            res.json({ memories: [], total: 0, page: 1, limit: 12, totalPages: 0, hasMore: false });
+            return;
+          }
+        }
         filter.collectionId = col;
       }
     }
 
-    // Pagination
-    const page = Math.max(1, Number(req.query.page) || 1);
-    const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 12));
+    // ⑤ Pagination — safe defaults and hard cap
+    const rawPage = Number(req.query.page);
+    const rawLimit = Number(req.query.limit);
+    const page = isNaN(rawPage) || rawPage < 1 ? 1 : Math.floor(rawPage);
+    const limit = isNaN(rawLimit) || rawLimit < 1 ? 12 : Math.min(Math.floor(rawLimit), 50);
     const skip = (page - 1) * limit;
 
     const [memories, total] = await Promise.all([
@@ -69,14 +116,7 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
     const totalPages = Math.ceil(total / limit);
     const hasMore = page < totalPages;
 
-    res.json({
-      memories,
-      total,
-      page,
-      limit,
-      totalPages,
-      hasMore,
-    });
+    res.json({ memories, total, page, limit, totalPages, hasMore });
   } catch (error) {
     res.status(500).json({
       message: "Failed to fetch memories",
@@ -85,7 +125,8 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
   }
 });
 
-// GET /mine - requireAuth: return all memories created by req.user.id
+// ── GET /mine ─────────────────────────────────────────────────────────────
+// requireAuth: return all memories created by req.user.id
 router.get("/mine", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const memories = await Memory.find({ userId: req.user!.id }).sort({ createdAt: -1 });
@@ -98,7 +139,8 @@ router.get("/mine", requireAuth, async (req: Request, res: Response): Promise<vo
   }
 });
 
-// POST /upload - upload device image to ImgBB using server-side API key
+// ── POST /upload ──────────────────────────────────────────────────────────
+// requireAuth: proxy device image upload to ImgBB using server-side API key
 router.post("/upload", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { image } = req.body;
@@ -147,7 +189,9 @@ router.post("/upload", requireAuth, async (req: Request, res: Response): Promise
   }
 });
 
-// POST / - requireAuth: create memory with userId & authorName
+// ── POST / ────────────────────────────────────────────────────────────────
+// requireAuth: create memory — userId, authorName and isApproved come from
+// the server session, never from the request body.
 router.post("/", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { title, story, imageUrl, year, visibility, collectionId } = req.body;
@@ -156,34 +200,50 @@ router.post("/", requireAuth, async (req: Request, res: Response): Promise<void>
       res.status(400).json({ message: "title is required" });
       return;
     }
-
     if (!story || typeof story !== "string" || !story.trim()) {
       res.status(400).json({ message: "story is required" });
       return;
     }
-
     if (!imageUrl || typeof imageUrl !== "string" || !imageUrl.trim()) {
       res.status(400).json({ message: "imageUrl is required" });
       return;
     }
 
-    if (year === undefined || year === null || isNaN(Number(year))) {
-      res.status(400).json({ message: "year is required and must be a valid number" });
+    const yearNum = clampYear(year);
+    if (yearNum === null) {
+      res.status(400).json({ message: `year must be a number between ${YEAR_MIN} and ${YEAR_MAX}` });
       return;
     }
 
-    const authorName = req.user?.name || req.user?.email || "Anonymous";
+    // ① Validate and verify ownership of collectionId before assigning
+    let resolvedCollectionId: string | null = null;
+    if (collectionId && typeof collectionId === "string" && collectionId.trim()) {
+      const colId = collectionId.trim();
+      if (!isValidObjectId(colId)) {
+        res.status(400).json({ message: "Invalid collectionId format" });
+        return;
+      }
+      const colDoc = await Collection.findById(colId).lean();
+      if (!colDoc || colDoc.userId !== req.user!.id) {
+        res.status(403).json({ message: "Forbidden: You do not own the specified collection" });
+        return;
+      }
+      resolvedCollectionId = colId;
+    }
+
+    // ② Always derive identity from the verified session
+    const authorName = req.user!.name || req.user!.email || "Anonymous";
 
     const memory = await Memory.create({
       title: title.trim(),
       story: story.trim(),
       imageUrl: imageUrl.trim(),
-      year: Number(year),
+      year: yearNum,
       visibility: visibility === "private" ? "private" : "public",
-      collectionId: collectionId ? String(collectionId).trim() : null,
-      userId: req.user!.id,
-      authorName,
-      isApproved: true,
+      collectionId: resolvedCollectionId,
+      userId: req.user!.id,       // from session — never body
+      authorName,                  // from session — never body
+      isApproved: true,            // server-controlled
     });
 
     res.status(201).json(memory);
@@ -195,12 +255,16 @@ router.post("/", requireAuth, async (req: Request, res: Response): Promise<void>
   }
 });
 
-// PATCH /:id - requireAuth: allow updating own memory
+// ── PATCH /:id ────────────────────────────────────────────────────────────
+// requireAuth: owner or admin may edit. userId, authorName and isApproved
+// are never updated from the request body.
 router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
-    const id = req.params.id;
-    if (!id) {
-      res.status(400).json({ message: "Memory ID is required" });
+    const { id } = req.params;
+
+    // ① Validate MongoDB ObjectId format
+    if (!id || !isValidObjectId(id)) {
+      res.status(400).json({ message: "Invalid memory ID" });
       return;
     }
 
@@ -210,20 +274,51 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
       return;
     }
 
-    if (memory.userId !== req.user!.id) {
+    // ② Owner or admin
+    const isOwner = memory.userId === req.user!.id;
+    const isAdmin = req.user!.role === "admin";
+    if (!isOwner && !isAdmin) {
       res.status(403).json({ message: "Forbidden: You are not authorized to edit this memory" });
       return;
     }
 
     const { title, story, imageUrl, year, visibility, collectionId } = req.body;
 
+    // ③ Apply editable fields — ignore userId / authorName / isApproved from body
     if (title && typeof title === "string" && title.trim()) memory.title = title.trim();
     if (story && typeof story === "string" && story.trim()) memory.story = story.trim();
     if (imageUrl && typeof imageUrl === "string" && imageUrl.trim()) memory.imageUrl = imageUrl.trim();
-    if (year !== undefined && !isNaN(Number(year))) memory.year = Number(year);
+
+    if (year !== undefined) {
+      const yearNum = clampYear(year);
+      if (yearNum === null) {
+        res.status(400).json({ message: `year must be a number between ${YEAR_MIN} and ${YEAR_MAX}` });
+        return;
+      }
+      memory.year = yearNum;
+    }
+
     if (visibility === "public" || visibility === "private") memory.visibility = visibility;
+
+    // ④ Validate collectionId ownership on update
     if (collectionId !== undefined) {
-      memory.collectionId = collectionId ? String(collectionId).trim() : null;
+      if (!collectionId || collectionId === null) {
+        memory.collectionId = null;
+      } else if (typeof collectionId === "string" && collectionId.trim()) {
+        const colId = collectionId.trim();
+        if (!isValidObjectId(colId)) {
+          res.status(400).json({ message: "Invalid collectionId format" });
+          return;
+        }
+        // The collection must belong to the memory's owner (not the admin
+        // acting on behalf of someone else). Use the memory's own userId.
+        const colDoc = await Collection.findById(colId).lean();
+        if (!colDoc || colDoc.userId !== memory.userId) {
+          res.status(403).json({ message: "Forbidden: The specified collection does not belong to this memory's owner" });
+          return;
+        }
+        memory.collectionId = colId;
+      }
     }
 
     await memory.save();
@@ -236,25 +331,26 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
   }
 });
 
-// DELETE /:id - requireAuth: allow if owner or req.user.role === "admin"
+// ── DELETE /:id ───────────────────────────────────────────────────────────
+// requireAuth: owner or admin may delete.
 router.delete("/:id", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
-    const id = req.params.id;
-    if (!id) {
-      res.status(400).json({ message: "Memory ID is required" });
+    const { id } = req.params;
+
+    // ① Validate MongoDB ObjectId format
+    if (!id || !isValidObjectId(id)) {
+      res.status(400).json({ message: "Invalid memory ID" });
       return;
     }
 
     const memory = await Memory.findById(id);
-
     if (!memory) {
       res.status(404).json({ message: "Memory not found" });
       return;
     }
 
-    const isOwner = Boolean(req.user?.id && memory.userId === req.user.id);
-    const isAdmin = req.user?.role === "admin";
-
+    const isOwner = req.user!.id === memory.userId;
+    const isAdmin = req.user!.role === "admin";
     if (!isOwner && !isAdmin) {
       res.status(403).json({ message: "Forbidden: You are not authorized to delete this memory" });
       return;
