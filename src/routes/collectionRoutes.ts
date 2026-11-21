@@ -29,6 +29,37 @@ router.get("/", requireAuth, async (req: Request, res: Response): Promise<void> 
   }
 });
 
+// ── GET /:id ──────────────────────────────────────────────────────────────
+// Fetch a single collection. Users can only view their own collections.
+router.get("/:id", requireAuth, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidObjectId(id)) {
+      res.status(400).json({ message: "Invalid collection ID" });
+      return;
+    }
+
+    const collection = await Collection.findById(id);
+    if (!collection) {
+      res.status(404).json({ message: "Collection not found" });
+      return;
+    }
+
+    if (collection.userId !== req.user!.id) {
+      res.status(403).json({ message: "Forbidden: You do not own this collection" });
+      return;
+    }
+
+    res.json(collection);
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to fetch collection",
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
 // ── POST / ─────────────────────────────────────────────────────────────────
 // Create a new collection. userId always comes from the session.
 router.post("/", requireAuth, async (req: Request, res: Response): Promise<void> => {
@@ -80,7 +111,7 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // ② Ownership check
+    // ② Ownership check: users can only manage their own collections
     if (collection.userId !== req.user!.id) {
       res.status(403).json({ message: "Forbidden: You do not own this collection" });
       return;
@@ -99,15 +130,14 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
 });
 
 // ── DELETE /:id ─────────────────────────────────────────────────────────────
-// Delete a collection and uncategorize ALL memories that reference it
-// (regardless of who authored them, since any memory can reference a
-// collection by ID).
+// Delete a collection and uncategorize memories that reference it.
+// Only the owner may delete their collection.
 router.delete("/:id", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
     // ① Validate ObjectId format
-    if (!id || !isValidObjectId(id)) {
+    if (!isValidObjectId(id)) {
       res.status(400).json({ message: "Invalid collection ID" });
       return;
     }
@@ -118,14 +148,13 @@ router.delete("/:id", requireAuth, async (req: Request, res: Response): Promise<
       return;
     }
 
-    // ② Ownership check
+    // ② Ownership check: users can only manage their own collections
     if (collection.userId !== req.user!.id) {
       res.status(403).json({ message: "Forbidden: You do not own this collection" });
       return;
     }
 
-    // ③ Cascade: uncategorize every memory pointing at this collection,
-    //    not just the owner's, to avoid stale collectionId references.
+    // ③ Cascade: uncategorize every memory pointing at this collection
     await Memory.updateMany({ collectionId: id }, { $set: { collectionId: null } });
 
     await Collection.findByIdAndDelete(id);

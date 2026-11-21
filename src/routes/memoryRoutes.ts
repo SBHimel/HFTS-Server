@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { Memory } from "../models/Memory.js";
 import { Collection } from "../models/Collection.js";
-import { requireAuth } from "../middleware/authMiddleware.js";
+import { requireAuth, hasMinimumRole } from "../middleware/authMiddleware.js";
 
 const router = Router();
 
@@ -29,23 +29,70 @@ function clampYear(raw: unknown): number | null {
 }
 
 // ── GET / ─────────────────────────────────────────────────────────────────
-// Public + user's own private (if auth); guests see only public+approved.
+// Visibility rules enforced at database query level:
+// 1. Guests: public approved memories only.
+// 2. Regular authenticated users: public approved memories + their own private memories.
+// 3. Admin/Moderator: all public memories (approved or unapproved for moderation) + their own private memories.
+// 4. In ALL cases: private memories of OTHER users are NEVER returned to anyone (including admins/moderators).
 router.get("/", async (req: Request, res: Response): Promise<void> => {
   try {
     const filter: Record<string, any> = {};
 
-    // ① Visibility / ownership filter — never trust client
-    if (req.user?.id) {
-      filter.$or = [
-        { visibility: "public", isApproved: true },
-        { userId: req.user.id }, // owner sees their own regardless of visibility/approval
-      ];
-    } else {
+    const isModeratorOrAdmin = req.user?.id ? hasMinimumRole(req.user.role, "moderator") : false;
+
+    // ① Base Visibility / ownership filter
+    if (req.query.visibility === "private") {
+      // If client explicitly requests private memories:
+      // Guests cannot view private memories.
+      if (!req.user?.id) {
+        res.json({ memories: [], total: 0, page: 1, limit: 12, totalPages: 0, hasMore: false });
+        return;
+      }
+      // Authenticated users (including admins/moderators) can ONLY see their OWN private memories.
+      filter.userId = req.user.id;
+      filter.visibility = "private";
+    } else if (req.query.visibility === "public") {
+      // If client explicitly requests public memories:
       filter.visibility = "public";
-      filter.isApproved = true;
+      if (!isModeratorOrAdmin) {
+        filter.isApproved = true;
+      }
+    } else {
+      // Default: browse all accessible memories
+      if (isModeratorOrAdmin) {
+        filter.$or = [
+          { visibility: "public" },
+          { userId: req.user!.id, visibility: "private" },
+        ];
+      } else if (req.user?.id) {
+        filter.$or = [
+          { visibility: "public", isApproved: true },
+          { userId: req.user.id },
+        ];
+      } else {
+        filter.visibility = "public";
+        filter.isApproved = true;
+      }
     }
 
-    // ② Year filter — validate and clamp range
+    // ② Moderation filter for isApproved (moderators/admins only, public memories only)
+    if (req.query.isApproved !== undefined && req.query.isApproved !== "") {
+      if (isModeratorOrAdmin) {
+        const approvedVal = req.query.isApproved === "true";
+        const approvalCondition = { visibility: "public", isApproved: approvedVal };
+        if (filter.$or) {
+          filter.$and = [{ $or: filter.$or }, approvalCondition];
+          delete filter.$or;
+        } else if (filter.$and) {
+          filter.$and.push(approvalCondition);
+        } else {
+          filter.isApproved = approvedVal;
+          filter.visibility = "public";
+        }
+      }
+    }
+
+    // ③ Year filter — validate and clamp range
     if (req.query.year !== undefined && req.query.year !== "") {
       const yearNum = clampYear(req.query.year);
       if (yearNum === null) {
@@ -55,7 +102,7 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
       filter.year = yearNum;
     }
 
-    // ③ Search — escape regex metacharacters (ReDoS prevention)
+    // ④ Search — escape regex metacharacters (ReDoS prevention)
     if (req.query.search && typeof req.query.search === "string" && req.query.search.trim()) {
       const term = escapeRegex(req.query.search.trim().slice(0, 200)); // cap length
       const searchRegex = { $regex: term, $options: "i" };
@@ -67,17 +114,18 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
       if (filter.$or) {
         filter.$and = [{ $or: filter.$or }, { $or: searchCondition }];
         delete filter.$or;
+      } else if (filter.$and) {
+        filter.$and.push({ $or: searchCondition });
       } else {
         filter.$or = searchCondition;
       }
     }
 
-    // ④ collectionId filter
+    // ⑤ collectionId filter
+    // Collections are private to their owners:
     // - "all" → no extra filter
     // - "uncategorized" → collectionId: null
-    // - specific ID → validate format; if the caller is authenticated and the
-    //   collection exists, it must belong to them (prevents fishing through
-    //   another user's private collection using a guessed collection ID).
+    // - specific ID → validate format & strictly require that caller owns the collection
     if (req.query.collectionId && typeof req.query.collectionId === "string") {
       const col = req.query.collectionId.trim();
       if (col === "uncategorized") {
@@ -87,21 +135,21 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
           res.status(400).json({ message: "Invalid collectionId format" });
           return;
         }
-        // If the caller is authenticated, enforce collection ownership so they
-        // cannot enumerate another user's collection contents.
-        if (req.user?.id) {
-          const colDoc = await Collection.findById(col).lean();
-          if (!colDoc || colDoc.userId !== req.user.id) {
-            // Return empty rather than 403 to avoid leaking existence
-            res.json({ memories: [], total: 0, page: 1, limit: 12, totalPages: 0, hasMore: false });
-            return;
-          }
+        // Guests have no collections, and users cannot filter by another user's collection.
+        if (!req.user?.id) {
+          res.json({ memories: [], total: 0, page: 1, limit: 12, totalPages: 0, hasMore: false });
+          return;
+        }
+        const colDoc = await Collection.findById(col).lean();
+        if (!colDoc || colDoc.userId !== req.user.id) {
+          res.json({ memories: [], total: 0, page: 1, limit: 12, totalPages: 0, hasMore: false });
+          return;
         }
         filter.collectionId = col;
       }
     }
 
-    // ⑤ Pagination — safe defaults and hard cap
+    // ⑥ Pagination — safe defaults and hard cap
     const rawPage = Number(req.query.page);
     const rawLimit = Number(req.query.limit);
     const page = isNaN(rawPage) || rawPage < 1 ? 1 : Math.floor(rawPage);
@@ -134,6 +182,52 @@ router.get("/mine", requireAuth, async (req: Request, res: Response): Promise<vo
   } catch (error) {
     res.status(500).json({
       message: "Failed to fetch user memories",
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+});
+
+// ── GET /:id ──────────────────────────────────────────────────────────────
+// Fetch a single memory by ID with strict visibility rules:
+// - Private memories: ONLY the owner can view. (Admins/mods CANNOT bypass)
+// - Public approved memories: anyone can view.
+// - Public unapproved memories: only owner and admin/moderator can view.
+router.get("/:id", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!id || !isValidObjectId(id)) {
+      res.status(400).json({ message: "Invalid memory ID" });
+      return;
+    }
+
+    const memory = await Memory.findById(id);
+    if (!memory) {
+      res.status(404).json({ message: "Memory not found" });
+      return;
+    }
+
+    const isOwner = Boolean(req.user?.id && memory.userId === req.user.id);
+    const isModeratorOrAdmin = req.user?.id ? hasMinimumRole(req.user.role, "moderator") : false;
+
+    // 1. Private memory: STRICTLY owner only.
+    if (memory.visibility === "private") {
+      if (!isOwner) {
+        res.status(404).json({ message: "Memory not found" });
+        return;
+      }
+    } else {
+      // 2. Public memory: if unapproved, only owner or moderator/admin can view.
+      if (!memory.isApproved && !isOwner && !isModeratorOrAdmin) {
+        res.status(404).json({ message: "Memory not found" });
+        return;
+      }
+    }
+
+    res.json(memory);
+  } catch (error) {
+    res.status(500).json({
+      message: "Failed to fetch memory",
       error: error instanceof Error ? error.message : "Unknown error",
     });
   }
@@ -191,7 +285,7 @@ router.post("/upload", requireAuth, async (req: Request, res: Response): Promise
 
 // ── POST / ────────────────────────────────────────────────────────────────
 // requireAuth: create memory — userId, authorName and isApproved come from
-// the server session, never from the request body.
+// the server session, never from client request body.
 router.post("/", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { title, story, imageUrl, year, visibility, collectionId } = req.body;
@@ -243,7 +337,7 @@ router.post("/", requireAuth, async (req: Request, res: Response): Promise<void>
       collectionId: resolvedCollectionId,
       userId: req.user!.id,       // from session — never body
       authorName,                  // from session — never body
-      isApproved: true,            // server-controlled
+      isApproved: true,            // server-controlled default
     });
 
     res.status(201).json(memory);
@@ -256,13 +350,15 @@ router.post("/", requireAuth, async (req: Request, res: Response): Promise<void>
 });
 
 // ── PATCH /:id ────────────────────────────────────────────────────────────
-// requireAuth: owner or admin may edit. userId, authorName and isApproved
-// are never updated from the request body.
+// - Private memories: ONLY the owner may edit. (Admins/mods CANNOT edit private memories).
+// - Public memories: Owner or moderator/admin may edit.
+//   - Owner: can edit title, story, imageUrl, year, visibility, collectionId.
+//   - Moderator/Admin: can moderate public memories (update isApproved, title, story, imageUrl, year).
+//     Moderator/Admin cannot alter visibility to private or reassign collection.
 router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
-    // ① Validate MongoDB ObjectId format
     if (!id || !isValidObjectId(id)) {
       res.status(400).json({ message: "Invalid memory ID" });
       return;
@@ -274,17 +370,28 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // ② Owner or admin
     const isOwner = memory.userId === req.user!.id;
-    const isAdmin = req.user!.role === "admin";
-    if (!isOwner && !isAdmin) {
-      res.status(403).json({ message: "Forbidden: You are not authorized to edit this memory" });
-      return;
+    const isModeratorOrAdmin = hasMinimumRole(req.user!.role, "moderator");
+
+    // ① Check authorization based on memory visibility
+    if (memory.visibility === "private") {
+      // Private memory: ONLY the owner can edit.
+      // Admin and moderator must NEVER bypass private memory ownership checks!
+      if (!isOwner) {
+        res.status(403).json({ message: "Forbidden: Only the owner can edit a private memory" });
+        return;
+      }
+    } else {
+      // Public memory: owner or moderator/admin
+      if (!isOwner && !isModeratorOrAdmin) {
+        res.status(403).json({ message: "Forbidden: You are not authorized to edit this memory" });
+        return;
+      }
     }
 
-    const { title, story, imageUrl, year, visibility, collectionId } = req.body;
+    const { title, story, imageUrl, year, visibility, collectionId, isApproved } = req.body;
 
-    // ③ Apply editable fields — ignore userId / authorName / isApproved from body
+    // ② Apply content edits
     if (title && typeof title === "string" && title.trim()) memory.title = title.trim();
     if (story && typeof story === "string" && story.trim()) memory.story = story.trim();
     if (imageUrl && typeof imageUrl === "string" && imageUrl.trim()) memory.imageUrl = imageUrl.trim();
@@ -298,10 +405,24 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
       memory.year = yearNum;
     }
 
-    if (visibility === "public" || visibility === "private") memory.visibility = visibility;
+    // ③ Visibility changes: ONLY the owner can change visibility!
+    // A moderator/admin cannot change the visibility of someone else's memory.
+    if (visibility !== undefined) {
+      if (!isOwner) {
+        res.status(403).json({ message: "Forbidden: Only the owner can change memory visibility" });
+        return;
+      }
+      if (visibility === "public" || visibility === "private") {
+        memory.visibility = visibility;
+      }
+    }
 
-    // ④ Validate collectionId ownership on update
+    // ④ Collection assignment: ONLY the owner can change collection!
     if (collectionId !== undefined) {
+      if (!isOwner) {
+        res.status(403).json({ message: "Forbidden: Only the owner can assign or change collections" });
+        return;
+      }
       if (!collectionId || collectionId === null) {
         memory.collectionId = null;
       } else if (typeof collectionId === "string" && collectionId.trim()) {
@@ -310,15 +431,27 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
           res.status(400).json({ message: "Invalid collectionId format" });
           return;
         }
-        // The collection must belong to the memory's owner (not the admin
-        // acting on behalf of someone else). Use the memory's own userId.
         const colDoc = await Collection.findById(colId).lean();
         if (!colDoc || colDoc.userId !== memory.userId) {
-          res.status(403).json({ message: "Forbidden: The specified collection does not belong to this memory's owner" });
+          res.status(403).json({ message: "Forbidden: The specified collection does not belong to you" });
           return;
         }
         memory.collectionId = colId;
       }
+    }
+
+    // ⑤ Moderation approval status: ONLY moderator/admin can change isApproved!
+    // Owner cannot approve their own memory if it was unapproved.
+    if (isApproved !== undefined) {
+      if (!isModeratorOrAdmin) {
+        res.status(403).json({ message: "Forbidden: Only moderators and admins can change approval status" });
+        return;
+      }
+      if (memory.visibility === "private") {
+        res.status(400).json({ message: "Bad Request: Private memories cannot be moderated" });
+        return;
+      }
+      memory.isApproved = Boolean(isApproved);
     }
 
     await memory.save();
@@ -332,12 +465,12 @@ router.patch("/:id", requireAuth, async (req: Request, res: Response): Promise<v
 });
 
 // ── DELETE /:id ───────────────────────────────────────────────────────────
-// requireAuth: owner or admin may delete.
+// - Private memories: ONLY the owner may delete. (Admins/mods CANNOT delete private memories).
+// - Public memories: Owner or moderator/admin may delete.
 router.delete("/:id", requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
-    // ① Validate MongoDB ObjectId format
     if (!id || !isValidObjectId(id)) {
       res.status(400).json({ message: "Invalid memory ID" });
       return;
@@ -350,10 +483,21 @@ router.delete("/:id", requireAuth, async (req: Request, res: Response): Promise<
     }
 
     const isOwner = req.user!.id === memory.userId;
-    const isAdmin = req.user!.role === "admin";
-    if (!isOwner && !isAdmin) {
-      res.status(403).json({ message: "Forbidden: You are not authorized to delete this memory" });
-      return;
+    const isModeratorOrAdmin = hasMinimumRole(req.user!.role, "moderator");
+
+    // 1. Private memory: strictly owner-only.
+    // Admin and moderator must NEVER bypass private memory ownership checks!
+    if (memory.visibility === "private") {
+      if (!isOwner) {
+        res.status(403).json({ message: "Forbidden: Only the owner can delete a private memory" });
+        return;
+      }
+    } else {
+      // 2. Public memory: owner or moderator/admin may delete
+      if (!isOwner && !isModeratorOrAdmin) {
+        res.status(403).json({ message: "Forbidden: You are not authorized to delete this memory" });
+        return;
+      }
     }
 
     await Memory.findByIdAndDelete(id);
