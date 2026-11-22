@@ -12,6 +12,7 @@ import { MongoClient } from "mongodb";
  *   bootstrapped on the next server restart after they sign up.
  * - The env var is never exposed to the client.
  */
+
 export async function bootstrapAdmin(): Promise<void> {
   const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
   if (!adminEmail) {
